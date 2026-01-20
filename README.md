@@ -32,5 +32,6 @@ from `2merkato.com`, stores them in a database, and displays them in chat. It is
 ## Notes
 
 - This is for learning/practice only.
-- The bot requires `DB_URL` and `TELEGRAM_TOKEN` in `config.json` (ignored by git).
+- The bot expects `DB_URL` and `TELEGRAM_TOKEN` as environment variables.
+- You can also use `config.json` for local runs (ignored by git).
 

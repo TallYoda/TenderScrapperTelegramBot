@@ -3,6 +3,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 
+import psycopg2
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,10 +22,12 @@ DETAIL_FIELDS = {
 }
 
 # ---------- CONFIG ----------
-CONFIG = get_required_config(["TELEGRAM_TOKEN"])
+CONFIG = get_required_config(["DB_URL", "TELEGRAM_TOKEN"])
+DB_URL = CONFIG["DB_URL"]
 TELEGRAM_TOKEN = CONFIG["TELEGRAM_TOKEN"]
 BASE_URL = "https://tender.2merkato.com/tenders/free?page={}"
-MAX_PAGES = 50
+DEFAULT_INITIAL_PAGES = 5
+DAILY_PAGES = 5
 
 # ---------- LOGGING ----------
 logging.basicConfig(
@@ -72,16 +75,114 @@ def _parse_date(value):
             continue
     return None
 
-async def scrape_tenders_since(days_count):
+def init_db():
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tenders1 (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            url TEXT,
+            bid_closing_date TEXT,
+            bid_opening_date TEXT,
+            published_on TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scrape_status (
+            id SERIAL PRIMARY KEY,
+            run_at TIMESTAMP NOT NULL,
+            pages_scraped INTEGER NOT NULL,
+            tenders_saved INTEGER NOT NULL
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def load_existing_ids():
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM tenders1;")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return set(row[0] for row in rows)
+
+def insert_tender(tender):
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tenders1 (id, title, url, bid_closing_date, bid_opening_date, published_on)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (id) DO NOTHING
+    """, (
+        tender["id"],
+        tender["title"],
+        tender["url"],
+        tender.get("bid_closing_date"),
+        tender.get("bid_opening_date"),
+        tender.get("published_on")
+    ))
+    inserted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return inserted
+
+def record_scrape_status(pages_scraped, tenders_saved):
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO scrape_status (run_at, pages_scraped, tenders_saved) VALUES (%s, %s, %s);",
+        (datetime.utcnow(), pages_scraped, tenders_saved)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_last_scrape_status():
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("SELECT run_at, pages_scraped, tenders_saved FROM scrape_status ORDER BY run_at DESC LIMIT 1;")
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row
+
+def get_tenders_since(days_count):
     cutoff_date = datetime.utcnow().date() - timedelta(days=max(days_count - 1, 0))
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, bid_closing_date, bid_opening_date, published_on, url FROM tenders1;")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
     results = []
-    seen_ids = set()
+    for row in rows:
+        published_on = row[4]
+        published_date = _parse_date(published_on)
+        if published_date and published_date >= cutoff_date:
+            results.append({
+                "id": row[0],
+                "title": row[1],
+                "bid_closing_date": row[2],
+                "bid_opening_date": row[3],
+                "published_on": published_on,
+                "url": row[5]
+            })
+    return results
+
+async def scrape_pages(pages_to_scrape):
+    existing_ids = load_existing_ids()
+    tenders_saved = 0
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            for page_num in range(1, MAX_PAGES + 1):
+            for page_num in range(1, pages_to_scrape + 1):
                 url = BASE_URL.format(page_num)
                 logging.info("Scraping page %s -> %s", page_num, url)
                 await page.goto(url, timeout=60000)
@@ -89,11 +190,7 @@ async def scrape_tenders_since(days_count):
                 html_content = await page.content()
                 soup = BeautifulSoup(html_content, "html.parser")
                 h3_tags = soup.select("h3.font-medium.text-lg.tracking-wide.leading-6")
-                if not h3_tags:
-                    break
 
-                page_has_newer = False
-                page_has_any_published = False
                 for h3 in h3_tags:
                     try:
                         a_tag = h3.select_one("a")
@@ -105,10 +202,8 @@ async def scrape_tenders_since(days_count):
                             continue
                         full_url = href if href.startswith("http") else "https://tender.2merkato.com" + href
                         tender_id = full_url.rstrip("/").split("/")[-1]
-                        if tender_id in seen_ids:
+                        if tender_id in existing_ids:
                             continue
-                        seen_ids.add(tender_id)
-
                         detail_div = h3.find_parent().find_next_sibling("div")
                         closing_date = opening_date = published_on = None
 
@@ -128,29 +223,26 @@ async def scrape_tenders_since(days_count):
                                 elif "published" in label_text.lower():
                                     published_on = value_text
 
-                        published_date = _parse_date(published_on)
-                        if published_date:
-                            page_has_any_published = True
-                        if published_date and published_date >= cutoff_date:
-                            page_has_newer = True
-                            results.append({
-                                "id": tender_id,
-                                "title": title,
-                                "url": full_url,
-                                "bid_closing_date": closing_date,
-                                "bid_opening_date": opening_date,
-                                "published_on": published_on
-                            })
+                        tender_data = {
+                            "id": tender_id,
+                            "title": title,
+                            "url": full_url,
+                            "bid_closing_date": closing_date,
+                            "bid_opening_date": opening_date,
+                            "published_on": published_on
+                        }
+                        inserted = insert_tender(tender_data)
+                        if inserted:
+                            existing_ids.add(tender_id)
+                            tenders_saved += 1
                     except Exception as exc:
                         logging.warning("Skipping tender: %s", exc)
-
-                if page_has_any_published and not page_has_newer and results:
-                    break
         finally:
             await page.close()
             await browser.close()
 
-    return results
+    record_scrape_status(pages_to_scrape, tenders_saved)
+    return tenders_saved
 
 async def scrape_tender_details(url):
     async with async_playwright() as p:
@@ -302,8 +394,8 @@ async def handle_range(update: Update, context: CallbackContext):
         await query.message.reply_text("Invalid selection.")
         return
 
-    await query.message.reply_text("⏳ Scraping tenders, please wait...")
-    tenders = await scrape_tenders_since(days_count)
+    await query.message.reply_text("🔎 Fetching tenders from the database...")
+    tenders = get_tenders_since(days_count)
     if not tenders:
         await query.message.reply_text("No tenders found for that period.")
         return
@@ -323,13 +415,44 @@ async def handle_range(update: Update, context: CallbackContext):
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.message.reply_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
 
+async def handle_status(update: Update, context: CallbackContext):
+    status = get_last_scrape_status()
+    if not status:
+        await update.message.reply_text("No scraping runs recorded yet.")
+        return
+    run_at, pages_scraped, tenders_saved = status
+    text = (
+        "📊 <b>Scrape Status</b>\n"
+        f"🕒 <b>Last run</b>: {run_at}\n"
+        f"📄 <b>Pages scraped</b>: {pages_scraped}\n"
+        f"✅ <b>New tenders saved</b>: {tenders_saved}"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def scheduled_scrape(context: CallbackContext):
+    try:
+        await scrape_pages(DAILY_PAGES)
+    except Exception as exc:
+        logging.error("Scheduled scrape failed: %s", exc)
+
+async def initial_scrape(context: CallbackContext):
+    try:
+        await scrape_pages(DEFAULT_INITIAL_PAGES)
+    except Exception as exc:
+        logging.error("Initial scrape failed: %s", exc)
+
 # ---------- MAIN ----------
 if __name__ == "__main__":
+    init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CallbackQueryHandler(handle_range, pattern=r"^range:"))
     app.add_handler(CallbackQueryHandler(handle_details, pattern=r"^details:"))
+
+    app.job_queue.run_once(initial_scrape, when=2)
+    app.job_queue.run_repeating(scheduled_scrape, interval=24 * 60 * 60, first=10)
 
     print("🤖 Bot is running...")
     app.run_polling()
