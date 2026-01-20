@@ -17,7 +17,7 @@ from `2merkato.com`, stores them in a database, and displays them in chat. It is
 - `python-telegram-bot` — Telegram bot framework.
 - `playwright` — headless browser automation for scraping.
 - `beautifulsoup4` — HTML parsing and data extraction.
-- `psycopg2` — PostgreSQL database access.
+- `psycopg` — PostgreSQL database access.
 - Standard library modules like `asyncio`, `datetime`, `logging`, `re`.
 
 ## Methods/Approach

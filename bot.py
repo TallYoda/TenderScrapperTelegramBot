@@ -3,7 +3,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 
-import psycopg2
+import psycopg
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -76,7 +76,7 @@ def _parse_date(value):
     return None
 
 def init_db():
-    conn = psycopg2.connect(DB_URL, sslmode="require")
+    conn = psycopg.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS tenders1 (
@@ -101,7 +101,7 @@ def init_db():
     conn.close()
 
 def load_existing_ids():
-    conn = psycopg2.connect(DB_URL, sslmode="require")
+    conn = psycopg.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
     cur.execute("SELECT id FROM tenders1;")
     rows = cur.fetchall()
@@ -110,7 +110,7 @@ def load_existing_ids():
     return set(row[0] for row in rows)
 
 def insert_tender(tender):
-    conn = psycopg2.connect(DB_URL, sslmode="require")
+    conn = psycopg.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO tenders1 (id, title, url, bid_closing_date, bid_opening_date, published_on)
@@ -131,7 +131,7 @@ def insert_tender(tender):
     return inserted
 
 def record_scrape_status(pages_scraped, tenders_saved):
-    conn = psycopg2.connect(DB_URL, sslmode="require")
+    conn = psycopg.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO scrape_status (run_at, pages_scraped, tenders_saved) VALUES (%s, %s, %s);",
@@ -142,7 +142,7 @@ def record_scrape_status(pages_scraped, tenders_saved):
     conn.close()
 
 def get_last_scrape_status():
-    conn = psycopg2.connect(DB_URL, sslmode="require")
+    conn = psycopg.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
     cur.execute("SELECT run_at, pages_scraped, tenders_saved FROM scrape_status ORDER BY run_at DESC LIMIT 1;")
     row = cur.fetchone()
@@ -152,7 +152,7 @@ def get_last_scrape_status():
 
 def get_tenders_since(days_count):
     cutoff_date = datetime.utcnow().date() - timedelta(days=max(days_count - 1, 0))
-    conn = psycopg2.connect(DB_URL, sslmode="require")
+    conn = psycopg.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
     cur.execute("SELECT id, title, bid_closing_date, bid_opening_date, published_on, url FROM tenders1;")
     rows = cur.fetchall()
