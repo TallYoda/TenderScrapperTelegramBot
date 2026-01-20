@@ -2,6 +2,7 @@ services:
   - type: web
     name: tender-scrapper-telegram-bot
     env: python
+    pythonVersion: 3.12.7
     plan: free
     buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: python bot.py
