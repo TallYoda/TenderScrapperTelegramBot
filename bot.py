@@ -451,8 +451,11 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_range, pattern=r"^range:"))
     app.add_handler(CallbackQueryHandler(handle_details, pattern=r"^details:"))
 
-    app.job_queue.run_once(initial_scrape, when=2)
-    app.job_queue.run_repeating(scheduled_scrape, interval=24 * 60 * 60, first=10)
+    if app.job_queue is None:
+        logging.warning("JobQueue not available; skipping scheduled scrapes.")
+    else:
+        app.job_queue.run_once(initial_scrape, when=2)
+        app.job_queue.run_repeating(scheduled_scrape, interval=24 * 60 * 60, first=10)
 
     print("🤖 Bot is running...")
     app.run_polling()
