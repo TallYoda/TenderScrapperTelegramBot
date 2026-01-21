@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -146,7 +147,7 @@ def record_scrape_status(pages_scraped, tenders_saved):
 async def scrape_detail_page(browser, url):
     page = await browser.new_page()
     try:
-        await page.goto(url, timeout=60000)
+        await page.goto(url, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_selector("div.ant-tree-list", timeout=15000)
         html_content = await page.content()
         soup = BeautifulSoup(html_content, "html.parser")
@@ -192,6 +193,9 @@ async def scrape_detail_page(browser, url):
             "metadata": metadata,
             "extra_fields": extra_fields
         }
+    except Exception as exc:
+        logging.warning("Detail scrape failed for %s: %s", url, exc)
+        return None
     finally:
         await page.close()
 
@@ -208,8 +212,27 @@ async def scrape_pages(pages_to_scrape, scrape_details=True):
             for page_num in range(1, pages_to_scrape + 1):
                 url = BASE_URL.format(page_num)
                 logging.info("Scraping page %s -> %s", page_num, url)
-                await page.goto(url, timeout=60000)
-                await page.wait_for_selector("h3.font-medium.text-lg.tracking-wide.leading-6 a", timeout=15000)
+
+                loaded = False
+                for attempt in range(1, 4):
+                    try:
+                        await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                        await page.wait_for_selector(
+                            "h3.font-medium.text-lg.tracking-wide.leading-6 a",
+                            timeout=15000
+                        )
+                        loaded = True
+                        break
+                    except Exception as exc:
+                        logging.warning("List page failed (attempt %s): %s", attempt, exc)
+                        await page.close()
+                        page = await browser.new_page()
+                        await asyncio.sleep(2 * attempt)
+
+                if not loaded:
+                    logging.warning("Skipping list page after retries: %s", url)
+                    continue
+
                 html_content = await page.content()
                 soup = BeautifulSoup(html_content, "html.parser")
                 h3_tags = soup.select("h3.font-medium.text-lg.tracking-wide.leading-6")
@@ -261,7 +284,8 @@ async def scrape_pages(pages_to_scrape, scrape_details=True):
                             tenders_saved += 1
                             if scrape_details:
                                 details = await scrape_detail_page(browser, full_url)
-                                upsert_tender_details(tender_id, details)
+                                if details:
+                                    upsert_tender_details(tender_id, details)
                     except Exception as exc:
                         logging.warning("Skipping tender: %s", exc)
         finally:
