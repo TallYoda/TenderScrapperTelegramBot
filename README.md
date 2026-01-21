@@ -9,7 +9,7 @@ from `2merkato.com`, stores them in a database, and displays them in chat. It is
 - Stores scraped tenders in a PostgreSQL database.
 - Lets users pick a date range (today, last 2 days, last 7 days).
 - Displays tender summaries in Telegram.
-- Fetches and formats detail pages on demand.
+- Displays tender details that were scraped by the scheduled scraper.
 - Exposes a `/status` command that reports the most recent scrape run.
 
 ## Libraries Used
@@ -23,9 +23,10 @@ from `2merkato.com`, stores them in a database, and displays them in chat. It is
 ## Methods/Approach
 
 - Listing pages are scraped from `https://tender.2merkato.com/tenders/free?page={}`.
-- An initial scrape runs on startup (first 5 pages), then a daily scrape runs after that.
+- Run `seed_db.py` locally to populate the database (defaults to 5 pages).
+- Run `scheduled_scraper.py` separately to keep the DB fresh.
 - Results are filtered by published date based on the selected time range.
-- Detail pages are scraped when a user taps “View Details”.
+- Detail pages are scraped by the scheduled scraper and stored in `tender_details`.
 - Data is formatted with HTML and emojis for readability inside Telegram.
 - Scrape progress is stored in a `scrape_status` table in the database.
 

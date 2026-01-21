@@ -1,42 +1,24 @@
 import html
+import json
 import logging
 import re
 from datetime import datetime, timedelta
 
 import psycopg
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext, CallbackQueryHandler
 from config_loader import get_required_config
-
-DETAIL_FIELDS = {
-    "bid closing date": "bid_closing_date",
-    "bid opening date": "bid_opening_date",
-    "published on": "published_on",
-    "posted": "posted",
-    "bid document price": "bid_document_price",
-    "bid bond": "bid_bond",
-    "region": "region",
-    "bidding": "bidding_type"
-}
 
 # ---------- CONFIG ----------
 CONFIG = get_required_config(["DB_URL", "TELEGRAM_TOKEN"])
 DB_URL = CONFIG["DB_URL"]
 TELEGRAM_TOKEN = CONFIG["TELEGRAM_TOKEN"]
-BASE_URL = "https://tender.2merkato.com/tenders/free?page={}"
-DEFAULT_INITIAL_PAGES = 5
-DAILY_PAGES = 5
 
 # ---------- LOGGING ----------
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-
-def _clean_text(value):
-    return " ".join(value.split()) if value else ""
 
 def _truncate(text, max_len=1800):
     if text and len(text) > max_len:
@@ -75,72 +57,6 @@ def _parse_date(value):
             continue
     return None
 
-def init_db():
-    conn = psycopg.connect(DB_URL, sslmode="require")
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS tenders1 (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            url TEXT,
-            bid_closing_date TEXT,
-            bid_opening_date TEXT,
-            published_on TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS scrape_status (
-            id SERIAL PRIMARY KEY,
-            run_at TIMESTAMP NOT NULL,
-            pages_scraped INTEGER NOT NULL,
-            tenders_saved INTEGER NOT NULL
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def load_existing_ids():
-    conn = psycopg.connect(DB_URL, sslmode="require")
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM tenders1;")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return set(row[0] for row in rows)
-
-def insert_tender(tender):
-    conn = psycopg.connect(DB_URL, sslmode="require")
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO tenders1 (id, title, url, bid_closing_date, bid_opening_date, published_on)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (id) DO NOTHING
-    """, (
-        tender["id"],
-        tender["title"],
-        tender["url"],
-        tender.get("bid_closing_date"),
-        tender.get("bid_opening_date"),
-        tender.get("published_on")
-    ))
-    inserted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    return inserted
-
-def record_scrape_status(pages_scraped, tenders_saved):
-    conn = psycopg.connect(DB_URL, sslmode="require")
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO scrape_status (run_at, pages_scraped, tenders_saved) VALUES (%s, %s, %s);",
-        (datetime.utcnow(), pages_scraped, tenders_saved)
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
 def get_last_scrape_status():
     conn = psycopg.connect(DB_URL, sslmode="require")
     cur = conn.cursor()
@@ -174,133 +90,67 @@ def get_tenders_since(days_count):
             })
     return results
 
-async def scrape_pages(pages_to_scrape):
-    existing_ids = load_existing_ids()
-    tenders_saved = 0
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            for page_num in range(1, pages_to_scrape + 1):
-                url = BASE_URL.format(page_num)
-                logging.info("Scraping page %s -> %s", page_num, url)
-                await page.goto(url, timeout=60000)
-                await page.wait_for_selector("h3.font-medium.text-lg.tracking-wide.leading-6 a", timeout=15000)
-                html_content = await page.content()
-                soup = BeautifulSoup(html_content, "html.parser")
-                h3_tags = soup.select("h3.font-medium.text-lg.tracking-wide.leading-6")
+def _safe_json_loads(value):
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return {}
 
-                for h3 in h3_tags:
-                    try:
-                        a_tag = h3.select_one("a")
-                        if not a_tag:
-                            continue
-                        title = a_tag.get_text(strip=True)
-                        href = a_tag.get("href", "").strip()
-                        if not href:
-                            continue
-                        full_url = href if href.startswith("http") else "https://tender.2merkato.com" + href
-                        tender_id = full_url.rstrip("/").split("/")[-1]
-                        if tender_id in existing_ids:
-                            continue
-                        detail_div = h3.find_parent().find_next_sibling("div")
-                        closing_date = opening_date = published_on = None
 
-                        if detail_div:
-                            for row in detail_div.select("div.flex.gap-x-4"):
-                                label = row.select_one("div.font-medium")
-                                if not label:
-                                    continue
-                                value_div = label.find_next_sibling("div")
-                                label_text = label.get_text(strip=True)
-                                value_text = value_div.get_text(strip=True) if value_div else ""
+def get_tender_by_id(tender_id):
+    conn = psycopg.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, title, bid_closing_date, bid_opening_date, published_on, url FROM tenders1 WHERE id = %s;",
+        (tender_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "title": row[1],
+        "bid_closing_date": row[2],
+        "bid_opening_date": row[3],
+        "published_on": row[4],
+        "url": row[5]
+    }
 
-                                if "closing date" in label_text.lower():
-                                    closing_date = value_text
-                                elif "opening date" in label_text.lower():
-                                    opening_date = value_text
-                                elif "published" in label_text.lower():
-                                    published_on = value_text
 
-                        tender_data = {
-                            "id": tender_id,
-                            "title": title,
-                            "url": full_url,
-                            "bid_closing_date": closing_date,
-                            "bid_opening_date": opening_date,
-                            "published_on": published_on
-                        }
-                        inserted = insert_tender(tender_data)
-                        if inserted:
-                            existing_ids.add(tender_id)
-                            tenders_saved += 1
-                    except Exception as exc:
-                        logging.warning("Skipping tender: %s", exc)
-        finally:
-            await page.close()
-            await browser.close()
+def get_tender_details(tender_id):
+    conn = psycopg.connect(DB_URL, sslmode="require")
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT title, description, filed_under, company, metadata_json, extra_fields_json
+        FROM tender_details
+        WHERE tender_id = %s;
+    """, (tender_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "title": row[0],
+        "description": row[1],
+        "filed_under": row[2],
+        "company": row[3],
+        "metadata": _safe_json_loads(row[4]),
+        "extra_fields": _safe_json_loads(row[5])
+    }
 
-    record_scrape_status(pages_to_scrape, tenders_saved)
-    return tenders_saved
-
-async def scrape_tender_details(url):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            await page.goto(url, timeout=60000)
-            await page.wait_for_selector("div.ant-tree-list", timeout=15000)
-            html_content = await page.content()
-            soup = BeautifulSoup(html_content, "html.parser")
-
-            title_tag = soup.select_one("h1.text-xl.font-semibold")
-            title = title_tag.get_text(strip=True) if title_tag else None
-
-            paragraphs = soup.find_all("p")
-            description = "\n".join(
-                p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)
-            )
-            description = _clean_text(description)
-
-            categories = list({a.get_text(strip=True) for a in soup.select("span.ant-tree-title a")})
-            filed_under = ", ".join(categories) if categories else None
-
-            company_tag = soup.select_one("h3.text-lg.font-medium.m-0.underline.text-blue-600 a")
-            company = company_tag.get_text(strip=True) if company_tag else None
-
-            metadata = {}
-            extra_fields = {}
-            info_rows = soup.select("div.flex.gap-x-4.gap-y-0.p-2.flex-wrap")
-            for row in info_rows:
-                label_div = row.select_one("div.font-medium")
-                if not label_div:
-                    continue
-                label_text = label_div.get_text(strip=True).rstrip(":")
-                value_div = label_div.find_next_sibling("div")
-                value_text = value_div.get_text(strip=True) if value_div else ""
-                if not value_text:
-                    continue
-                label_key = label_text.lower()
-                key = DETAIL_FIELDS.get(label_key)
-                if key:
-                    metadata[key] = value_text
-                else:
-                    extra_fields[label_text] = value_text
-
-            return {
-                "title": title,
-                "description": description,
-                "filed_under": filed_under,
-                "company": company,
-                "metadata": metadata,
-                "extra_fields": extra_fields
-            }
-        finally:
-            await page.close()
-            await browser.close()
 
 def format_tender_details(tender, details):
+    if not details:
+        return (
+            "ℹ️ Details are not available yet.\n"
+            "Please try again later after the scheduled scraper runs."
+        )
     title = details.get("title") or tender.get("title") or "Tender Details"
     title_html = html.escape(title)
     closing = html.escape(tender.get("bid_closing_date") or "N/A")
@@ -369,18 +219,19 @@ async def handle_details(update: Update, context: CallbackContext):
 
     tender_id = query.data.split(":", 1)[1]
     tender_cache = context.bot_data.get("tender_cache", {})
-    tender = tender_cache.get(tender_id)
-    if not tender:
-        await query.message.reply_text("Tender not found. Please request tenders again.")
+    try:
+        tender = tender_cache.get(tender_id) or get_tender_by_id(tender_id)
+        if not tender:
+            await query.message.reply_text("Tender not found.")
+            return
+        details = get_tender_details(tender_id)
+    except Exception as exc:
+        logging.error("DB query failed: %s", exc)
+        await query.message.reply_text("Database is not ready yet. Please try later.")
         return
 
-    await query.message.reply_text("Fetching details...")
-    try:
-        details = await scrape_tender_details(tender["url"])
-        message = format_tender_details(tender, details)
-        await query.message.reply_text(message, parse_mode="HTML")
-    except Exception as exc:
-        await query.message.reply_text(f"Failed to fetch details: {exc}")
+    message = format_tender_details(tender, details)
+    await query.message.reply_text(message, parse_mode="HTML")
 
 async def handle_range(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -395,7 +246,12 @@ async def handle_range(update: Update, context: CallbackContext):
         return
 
     await query.message.reply_text("🔎 Fetching tenders from the database...")
-    tenders = get_tenders_since(days_count)
+    try:
+        tenders = get_tenders_since(days_count)
+    except Exception as exc:
+        logging.error("DB query failed: %s", exc)
+        await query.message.reply_text("Database is not ready yet. Please try later.")
+        return
     if not tenders:
         await query.message.reply_text("No tenders found for that period.")
         return
@@ -416,7 +272,12 @@ async def handle_range(update: Update, context: CallbackContext):
         await query.message.reply_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
 
 async def handle_status(update: Update, context: CallbackContext):
-    status = get_last_scrape_status()
+    try:
+        status = get_last_scrape_status()
+    except Exception as exc:
+        logging.error("DB query failed: %s", exc)
+        await update.message.reply_text("Database is not ready yet. Please try later.")
+        return
     if not status:
         await update.message.reply_text("No scraping runs recorded yet.")
         return
@@ -429,33 +290,14 @@ async def handle_status(update: Update, context: CallbackContext):
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
-async def scheduled_scrape(context: CallbackContext):
-    try:
-        await scrape_pages(DAILY_PAGES)
-    except Exception as exc:
-        logging.error("Scheduled scrape failed: %s", exc)
-
-async def initial_scrape(context: CallbackContext):
-    try:
-        await scrape_pages(DEFAULT_INITIAL_PAGES)
-    except Exception as exc:
-        logging.error("Initial scrape failed: %s", exc)
-
 # ---------- MAIN ----------
 if __name__ == "__main__":
-    init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", handle_status))
     app.add_handler(CallbackQueryHandler(handle_range, pattern=r"^range:"))
     app.add_handler(CallbackQueryHandler(handle_details, pattern=r"^details:"))
-
-    if app.job_queue is None:
-        logging.warning("JobQueue not available; skipping scheduled scrapes.")
-    else:
-        app.job_queue.run_once(initial_scrape, when=2)
-        app.job_queue.run_repeating(scheduled_scrape, interval=24 * 60 * 60, first=10)
 
     print("🤖 Bot is running...")
     app.run_polling()
