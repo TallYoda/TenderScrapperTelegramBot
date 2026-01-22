@@ -6,9 +6,20 @@ services:
     plan: free
     envVars:
       - key: DB_URL
-        value: "postgresql://neondb_owner:npg_ebB8RXhxy0jd@ep-silent-bird-agu5fil6-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+        value: "postgresql://neondb_owner:npg_ebB8RXhxy0jd@ep-silent-bird-agu5fil6-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&options=endpoint%3Dep-silent-bird-agu5fil6-pooler"
       - key: TELEGRAM_TOKEN
         sync: false
     buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: python bot.py
+
+  - type: worker
+    name: tender-scrapper-scheduler
+    env: python
+    pythonVersion: 3.12.7
+    plan: free
+    envVars:
+      - key: DB_URL
+        value: "postgresql://neondb_owner:npg_ebB8RXhxy0jd@ep-silent-bird-agu5fil6-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&options=endpoint%3Dep-silent-bird-agu5fil6-pooler"
+    buildCommand: pip install -r requirements.txt && playwright install chromium
+    startCommand: python scheduled_scraper.py --pages 5 --interval-hours 24
 
