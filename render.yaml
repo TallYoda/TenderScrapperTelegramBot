@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: worker
     name: tender-scrapper-telegram-bot
     env: python
     pythonVersion: 3.12.7
