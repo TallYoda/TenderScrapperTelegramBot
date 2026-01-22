@@ -29,12 +29,32 @@ def _normalize_date_text(value):
     if not value:
         return ""
     cleaned = value.replace(",", " ")
+    cleaned = cleaned.replace("(", " ").replace(")", " ")
     cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
-def _parse_date(value):
+
+def _extract_date_candidate(value):
     cleaned = _normalize_date_text(value)
+    if not cleaned:
+        return ""
+    patterns = [
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{4}",
+        r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s+\d{4}",
+        r"\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}",
+        r"\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}",
+        r"\d{4}-\d{2}-\d{2}",
+        r"\d{1,2}/\d{1,2}/\d{4}"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            return match.group(0)
+    return cleaned
+
+def _parse_date(value):
+    cleaned = _extract_date_candidate(value)
     if not cleaned:
         return None
     lowered = cleaned.lower()
